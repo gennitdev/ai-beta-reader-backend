@@ -496,6 +496,56 @@ app.get("/ai-profiles", authenticateJWT, async (req: AuthenticatedRequest, res) 
   }
 });
 
+app.get("/ai-profiles/:id", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const profileId = req.params.id;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Get AI profile details
+    const { rows: profileRows } = await pool.query(
+      `SELECT id, name, tone_key, system_prompt, created_at, is_system, is_default
+       FROM ai_profiles
+       WHERE id = $1`,
+      [profileId]
+    );
+
+    if (!profileRows.length) {
+      return res.status(404).json({ error: "AI profile not found" });
+    }
+
+    const profile = profileRows[0];
+
+    // Get all reviews by this AI profile that the user can access (reviews on user's chapters)
+    const { rows: reviewRows } = await pool.query(
+      `SELECT r.id, r.review_text, r.created_at, r.updated_at,
+              c.id as chapter_id, c.title as chapter_title,
+              b.id as book_id, b.title as book_title
+       FROM chapter_reviews r
+       JOIN chapters c ON r.chapter_id = c.id
+       JOIN books b ON c.book_id = b.id
+       WHERE r.ai_profile_id = $1 AND b.user_id = $2
+       ORDER BY r.created_at DESC`,
+      [profileId, dbUser.id]
+    );
+
+    res.json({
+      profile,
+      reviews: reviewRows
+    });
+  } catch (error) {
+    console.error("Get AI profile error:", error);
+    res.status(500).json({ error: "Failed to get AI profile" });
+  }
+});
+
 app.post("/ai-profiles", authenticateJWT, async (req: AuthenticatedRequest, res) => {
   try {
     const data = CreateAIProfile.parse(req.body);
