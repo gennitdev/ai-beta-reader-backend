@@ -253,15 +253,26 @@ app.post("/chapters/:id/summary", authenticateJWT, async (req: AuthenticatedRequ
       return res.status(403).json({ error: "You don't have permission to access this chapter" });
     }
 
+    // Check if this is the first chapter by counting previous chapters
+    const { rows: chapterCountRows } = await pool.query(
+      `SELECT COUNT(*) as chapter_count
+       FROM chapters c
+       WHERE c.book_id = $1 AND c.id < $2`,
+      [chapter.book_id, chapterId]
+    );
+
+    const isFirstChapter = parseInt(chapterCountRows[0].chapter_count) === 0;
+
     // call OpenAI Chat Completions API with JSON mode
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini", // Use a model that supports JSON mode
       messages: [
         { role: "system", content:
-          "You are an expert fiction editor. Produce a tight factual summary (150–250 words), include POV, main characters, and 4–8 bullet beats. No speculation. Return valid JSON only."},
+          `You are an expert fiction editor. Produce a tight factual summary (150–250 words), include POV, main characters, and 4–8 bullet beats. No speculation. Return valid JSON only.${isFirstChapter ? ' IMPORTANT: This is the FIRST chapter of the book - there are no previous chapters to reference. Focus only on what happens in this opening chapter.' : ''}`},
         { role: "user", content:
           `Book: ${chapter.book_title} (${chapter.book_id})\n` +
-          `Chapter: ${chapter.id}${chapter.title ? ` — ${chapter.title}` : ""}\n\n` +
+          `Chapter: ${chapter.id}${chapter.title ? ` — ${chapter.title}` : ""}${isFirstChapter ? ' (FIRST CHAPTER)' : ''}\n\n` +
+          `${isFirstChapter ? 'This is the opening chapter of the book. Summarize only what happens in this first chapter. Do not reference any previous events or chapters.\n\n' : ''}` +
           "Return JSON only for this schema: {pov, characters[], beats[], spoilers_ok, summary}\n\n" +
           chapter.text
         }
