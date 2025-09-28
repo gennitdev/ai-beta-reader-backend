@@ -85,7 +85,7 @@ app.post("/chapters/:id/summary", async (req, res, next) => {
       temperature: 0.3
     });
 
-    const content = response.choices[0].message.content;
+    const content = response.choices[0]?.message?.content;
     if (!content) {
       throw new Error("No content received from OpenAI");
     }
@@ -149,7 +149,7 @@ app.post("/reviews", async (req, res, next) => {
       temperature: 0.7
     });
 
-    res.json({ ok: true, review: response.choices[0].message.content });
+    res.json({ ok: true, review: response.choices[0]?.message?.content || "" });
   } catch (e) { next(e); }
 });
 
