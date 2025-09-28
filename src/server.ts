@@ -203,16 +203,23 @@ app.post("/chapters", authenticateJWT, async (req: AuthenticatedRequest, res) =>
       return res.status(403).json({ error: "You don't have permission to add chapters to this book" });
     }
 
+    // Get the next position for new chapters
+    const { rows: positionRows } = await pool.query(
+      'SELECT COALESCE(MAX(position), -1) + 1 as next_position FROM chapters WHERE book_id = $1',
+      [data.bookId]
+    );
+    const nextPosition = positionRows[0].next_position;
+
     await pool.query(
-      `INSERT INTO chapters(id, book_id, title, text, word_count, updated_at)
-       VALUES ($1,$2,$3,$4,$5, now())
+      `INSERT INTO chapters(id, book_id, title, text, word_count, position, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6, now())
        ON CONFLICT (id) DO UPDATE SET
          book_id=EXCLUDED.book_id,
          title=EXCLUDED.title,
          text=EXCLUDED.text,
          word_count=EXCLUDED.word_count,
          updated_at=now()`,
-      [data.id, data.bookId, data.title ?? null, data.text, wordCount]
+      [data.id, data.bookId, data.title ?? null, data.text, wordCount, nextPosition]
     );
 
     res.json({ ok: true, wordCount });
@@ -898,13 +905,15 @@ app.get("/books/:id/chapters", authenticateJWT, async (req: AuthenticatedRequest
     }
 
     const { rows } = await pool.query(`
-      SELECT c.id, c.title, c.word_count,
+      SELECT c.id, c.title, c.word_count, c.position, c.part_id,
              CASE WHEN s.chapter_id IS NULL THEN false ELSE true END AS has_summary,
-             s.summary
+             s.summary,
+             p.name as part_name, p.position as part_position
         FROM chapters c
         LEFT JOIN chapter_summaries s ON s.chapter_id = c.id
+        LEFT JOIN book_parts p ON c.part_id = p.id
        WHERE c.book_id=$1
-       ORDER BY c.id`, [req.params.id]);
+       ORDER BY COALESCE(p.position, 999999), c.position, c.id`, [req.params.id]);
 
     res.json(rows);
   } catch (error) {
@@ -1326,6 +1335,307 @@ app.get("/wiki/:id/history", authenticateJWT, async (req: AuthenticatedRequest, 
 app.use((err:any, _req:any, res:any, _next:any) => {
   console.error(err);
   res.status(500).json({ error: "Internal error", detail: String(err?.message || err) });
+});
+
+// Book Parts Management
+app.get("/books/:bookId/parts", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book
+    const { rows: bookRows } = await pool.query(
+      'SELECT user_id FROM books WHERE id = $1',
+      [req.params.bookId]
+    );
+
+    if (!bookRows.length) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    if (bookRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to access this book" });
+    }
+
+    const { rows } = await pool.query(
+      'SELECT id, name, position FROM book_parts WHERE book_id = $1 ORDER BY position',
+      [req.params.bookId]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Get parts error:", error);
+    res.status(500).json({ error: "Failed to get parts" });
+  }
+});
+
+app.post("/books/:bookId/parts", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { name, position } = req.body;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book
+    const { rows: bookRows } = await pool.query(
+      'SELECT user_id FROM books WHERE id = $1',
+      [req.params.bookId]
+    );
+
+    if (!bookRows.length) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    if (bookRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to modify this book" });
+    }
+
+    const { rows } = await pool.query(
+      'INSERT INTO book_parts (book_id, name, position) VALUES ($1, $2, $3) RETURNING *',
+      [req.params.bookId, name, position ?? 0]
+    );
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("Create part error:", error);
+    res.status(500).json({ error: "Failed to create part" });
+  }
+});
+
+app.put("/books/:bookId/parts/:partId", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { name, position } = req.body;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book
+    const { rows: bookRows } = await pool.query(
+      'SELECT user_id FROM books WHERE id = $1',
+      [req.params.bookId]
+    );
+
+    if (!bookRows.length) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    if (bookRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to modify this book" });
+    }
+
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+
+    if (name !== undefined) {
+      updates.push(`name = $${paramCount++}`);
+      values.push(name);
+    }
+
+    if (position !== undefined) {
+      updates.push(`position = $${paramCount++}`);
+      values.push(position);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No updates provided" });
+    }
+
+    values.push(req.params.partId, req.params.bookId);
+
+    const { rows } = await pool.query(
+      `UPDATE book_parts SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $${paramCount} AND book_id = $${paramCount + 1}
+       RETURNING *`,
+      values
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Part not found" });
+    }
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("Update part error:", error);
+    res.status(500).json({ error: "Failed to update part" });
+  }
+});
+
+app.delete("/books/:bookId/parts/:partId", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book
+    const { rows: bookRows } = await pool.query(
+      'SELECT user_id FROM books WHERE id = $1',
+      [req.params.bookId]
+    );
+
+    if (!bookRows.length) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    if (bookRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to modify this book" });
+    }
+
+    // Remove chapters from this part (set part_id to NULL)
+    await pool.query(
+      'UPDATE chapters SET part_id = NULL WHERE part_id = $1',
+      [req.params.partId]
+    );
+
+    const { rows } = await pool.query(
+      'DELETE FROM book_parts WHERE id = $1 AND book_id = $2 RETURNING id',
+      [req.params.partId, req.params.bookId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Part not found" });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Delete part error:", error);
+    res.status(500).json({ error: "Failed to delete part" });
+  }
+});
+
+// Chapter Reordering
+app.put("/chapters/:chapterId/reorder", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { position, partId } = req.body;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Get chapter and verify ownership
+    const { rows: chapterRows } = await pool.query(
+      `SELECT c.id, c.book_id, b.user_id
+       FROM chapters c
+       JOIN books b ON c.book_id = b.id
+       WHERE c.id = $1`,
+      [req.params.chapterId]
+    );
+
+    if (!chapterRows.length) {
+      return res.status(404).json({ error: "Chapter not found" });
+    }
+
+    if (chapterRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to modify this chapter" });
+    }
+
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+
+    if (position !== undefined) {
+      updates.push(`position = $${paramCount++}`);
+      values.push(position);
+    }
+
+    if (partId !== undefined) {
+      updates.push(`part_id = $${paramCount++}`);
+      values.push(partId === null ? null : partId);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No updates provided" });
+    }
+
+    values.push(req.params.chapterId);
+
+    const { rows } = await pool.query(
+      `UPDATE chapters SET ${updates.join(', ')}
+       WHERE id = $${paramCount}
+       RETURNING id, position, part_id`,
+      values
+    );
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("Reorder chapter error:", error);
+    res.status(500).json({ error: "Failed to reorder chapter" });
+  }
+});
+
+// Batch reorder chapters (for drag and drop)
+app.put("/books/:bookId/chapters/reorder", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const { chapters } = req.body; // Array of { id, position, partId? }
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book
+    const { rows: bookRows } = await pool.query(
+      'SELECT user_id FROM books WHERE id = $1',
+      [req.params.bookId]
+    );
+
+    if (!bookRows.length) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    if (bookRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to modify this book" });
+    }
+
+    // Update all chapters in a transaction
+    await withTx(async (client) => {
+      for (const chapter of chapters) {
+        await client.query(
+          `UPDATE chapters
+           SET position = $1, part_id = $2
+           WHERE id = $3 AND book_id = $4`,
+          [chapter.position, chapter.partId || null, chapter.id, req.params.bookId]
+        );
+      }
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Batch reorder error:", error);
+    res.status(500).json({ error: "Failed to reorder chapters" });
+  }
 });
 
 app.listen(process.env.PORT || 3001, () => {
