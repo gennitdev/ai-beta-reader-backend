@@ -26,6 +26,17 @@ const ReviewReq = z.object({
   newChapterId: z.string().min(1),
   tone: z.enum(["fanficnet","editorial","line-notes"]).optional()
 });
+const CreateAIProfile = z.object({
+  name: z.string().min(1),
+  tone_key: z.string().min(1),
+  system_prompt: z.string().min(1),
+  is_default: z.boolean().optional()
+});
+const UpdateAIProfile = z.object({
+  name: z.string().min(1).optional(),
+  system_prompt: z.string().min(1).optional(),
+  is_default: z.boolean().optional()
+});
 
 // ---- Auth routes
 app.post("/auth/profile", authenticateJWT, async (req: AuthenticatedRequest, res) => {
@@ -265,6 +276,273 @@ app.post("/chapters/:id/summary", authenticateJWT, async (req: AuthenticatedRequ
   } catch (e) { next(e); }
 });
 
+// ---- AI Profiles routes
+app.get("/ai-profiles", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Get user's custom profiles and system profiles
+    const { rows } = await pool.query(
+      `SELECT id, name, tone_key, system_prompt, is_default, is_system, created_at, updated_at
+       FROM ai_profiles
+       WHERE user_id = $1 OR is_system = true
+       ORDER BY is_system DESC, name ASC`,
+      [dbUser.id]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Get AI profiles error:", error);
+    res.status(500).json({ error: "Failed to get AI profiles" });
+  }
+});
+
+app.post("/ai-profiles", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const data = CreateAIProfile.parse(req.body);
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // If setting as default, unset other defaults first
+    if (data.is_default) {
+      await pool.query(
+        'UPDATE ai_profiles SET is_default = false WHERE user_id = $1',
+        [dbUser.id]
+      );
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO ai_profiles (user_id, name, tone_key, system_prompt, is_default)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, tone_key, system_prompt, is_default, is_system, created_at, updated_at`,
+      [dbUser.id, data.name, data.tone_key, data.system_prompt, data.is_default || false]
+    );
+
+    res.json({ ok: true, profile: rows[0] });
+  } catch (error) {
+    console.error("Create AI profile error:", error);
+    res.status(500).json({ error: "Failed to create AI profile" });
+  }
+});
+
+app.put("/ai-profiles/:id", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const profileId = req.params.id;
+    const data = UpdateAIProfile.parse(req.body);
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the profile and it's not a system profile
+    const { rows: profileRows } = await pool.query(
+      'SELECT user_id, is_system FROM ai_profiles WHERE id = $1',
+      [profileId]
+    );
+
+    if (!profileRows.length) {
+      return res.status(404).json({ error: "AI profile not found" });
+    }
+
+    if (profileRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to edit this profile" });
+    }
+
+    if (profileRows[0].is_system) {
+      return res.status(403).json({ error: "Cannot edit system profiles" });
+    }
+
+    // If setting as default, unset other defaults first
+    if (data.is_default) {
+      await pool.query(
+        'UPDATE ai_profiles SET is_default = false WHERE user_id = $1',
+        [dbUser.id]
+      );
+    }
+
+    // Build dynamic update query
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (data.name !== undefined) {
+      updates.push(`name = $${paramIndex++}`);
+      values.push(data.name);
+    }
+    if (data.system_prompt !== undefined) {
+      updates.push(`system_prompt = $${paramIndex++}`);
+      values.push(data.system_prompt);
+    }
+    if (data.is_default !== undefined) {
+      updates.push(`is_default = $${paramIndex++}`);
+      values.push(data.is_default);
+    }
+
+    updates.push(`updated_at = now()`);
+    values.push(profileId);
+
+    const { rows } = await pool.query(
+      `UPDATE ai_profiles SET ${updates.join(', ')}
+       WHERE id = $${paramIndex}
+       RETURNING id, name, tone_key, system_prompt, is_default, is_system, created_at, updated_at`,
+      values
+    );
+
+    res.json({ ok: true, profile: rows[0] });
+  } catch (error) {
+    console.error("Update AI profile error:", error);
+    res.status(500).json({ error: "Failed to update AI profile" });
+  }
+});
+
+app.delete("/ai-profiles/:id", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const profileId = req.params.id;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the profile and it's not a system profile
+    const { rows: profileRows } = await pool.query(
+      'SELECT user_id, is_system FROM ai_profiles WHERE id = $1',
+      [profileId]
+    );
+
+    if (!profileRows.length) {
+      return res.status(404).json({ error: "AI profile not found" });
+    }
+
+    if (profileRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to delete this profile" });
+    }
+
+    if (profileRows[0].is_system) {
+      return res.status(403).json({ error: "Cannot delete system profiles" });
+    }
+
+    await pool.query('DELETE FROM ai_profiles WHERE id = $1', [profileId]);
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Delete AI profile error:", error);
+    res.status(500).json({ error: "Failed to delete AI profile" });
+  }
+});
+
+// ---- Chapter Reviews routes
+app.get("/chapters/:id/reviews", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const chapterId = req.params.id;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the chapter
+    const { rows: chapterRows } = await pool.query(
+      `SELECT c.id, b.user_id
+       FROM chapters c
+       JOIN books b ON c.book_id = b.id
+       WHERE c.id = $1`,
+      [chapterId]
+    );
+
+    if (!chapterRows.length) {
+      return res.status(404).json({ error: "Chapter not found" });
+    }
+
+    if (chapterRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to access this chapter" });
+    }
+
+    // Get all reviews for this chapter
+    const { rows } = await pool.query(
+      `SELECT r.id, r.review_text, r.created_at, r.updated_at,
+              p.id as profile_id, p.name as profile_name, p.tone_key
+       FROM chapter_reviews r
+       JOIN ai_profiles p ON r.ai_profile_id = p.id
+       WHERE r.chapter_id = $1
+       ORDER BY r.created_at DESC`,
+      [chapterId]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Get chapter reviews error:", error);
+    res.status(500).json({ error: "Failed to get chapter reviews" });
+  }
+});
+
+app.delete("/reviews/:id", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const reviewId = req.params.id;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the chapter this review belongs to
+    const { rows: reviewRows } = await pool.query(
+      `SELECT r.id, b.user_id
+       FROM chapter_reviews r
+       JOIN chapters c ON r.chapter_id = c.id
+       JOIN books b ON c.book_id = b.id
+       WHERE r.id = $1`,
+      [reviewId]
+    );
+
+    if (!reviewRows.length) {
+      return res.status(404).json({ error: "Review not found" });
+    }
+
+    if (reviewRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to delete this review" });
+    }
+
+    await pool.query('DELETE FROM chapter_reviews WHERE id = $1', [reviewId]);
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Delete review error:", error);
+    res.status(500).json({ error: "Failed to delete review" });
+  }
+});
+
 // Create a chapter-specific review with all prior summaries
 app.post("/reviews", authenticateJWT, async (req: AuthenticatedRequest, res, next) => {
   try {
@@ -307,19 +585,27 @@ app.post("/reviews", authenticateJWT, async (req: AuthenticatedRequest, res, nex
     if (!targetRows.length) return res.status(404).json({ error: "New chapter not found" });
     const target = targetRows[0];
 
-    const priorSummariesText = prior.map(r => `# ${r.id}${r.title ? ` — ${r.title}`:""}\n${r.summary}`).join("\n\n");
+    // Get AI profile for the requested tone
+    const { rows: profileRows } = await pool.query(
+      `SELECT id, system_prompt
+       FROM ai_profiles
+       WHERE (user_id = $1 OR is_system = true) AND tone_key = $2
+       ORDER BY is_system ASC
+       LIMIT 1`,
+      [dbUser.id, tone]
+    );
 
-    const system =
-      tone === "fanficnet"
-        ? "You are a thoughtful, enthusiastic serial reader. React to THIS new chapter in context of prior summaries. 2–5 short paragraphs; warm, specific; reference arcs/payoffs; no spoilers beyond prior summaries."
-        : tone === "editorial"
-        ? "You are a concise developmental editor. Give specific, actionable notes about structure, character, pacing, and continuity for THIS chapter in context."
-        : "You are a line editor. Provide concrete line-level suggestions with examples.";
+    if (!profileRows.length) {
+      return res.status(404).json({ error: `AI profile not found for tone: ${tone}` });
+    }
+
+    const aiProfile = profileRows[0];
+    const priorSummariesText = prior.map(r => `# ${r.id}${r.title ? ` — ${r.title}`:""}\n${r.summary}`).join("\n\n");
 
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: system },
+        { role: "system", content: aiProfile.system_prompt },
         { role: "user", content:
           `PRIOR CHAPTER SUMMARIES:\n${priorSummariesText}\n\n` +
           `NEW CHAPTER: ${target.id}${target.title ? ` — ${target.title}` : ""}\n${target.text}\n\n` +
@@ -328,7 +614,18 @@ app.post("/reviews", authenticateJWT, async (req: AuthenticatedRequest, res, nex
       temperature: 0.7
     });
 
-    res.json({ ok: true, review: response.choices[0]?.message?.content || "" });
+    const reviewText = response.choices[0]?.message?.content || "";
+
+    // Save the review to the database
+    await pool.query(
+      `INSERT INTO chapter_reviews (chapter_id, ai_profile_id, review_text)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (chapter_id, ai_profile_id)
+       DO UPDATE SET review_text = EXCLUDED.review_text, updated_at = now()`,
+      [newChapterId, aiProfile.id, reviewText]
+    );
+
+    res.json({ ok: true, review: reviewText });
   } catch (e) { next(e); }
 });
 

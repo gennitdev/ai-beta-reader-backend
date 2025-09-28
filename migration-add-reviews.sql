@@ -1,45 +1,10 @@
--- AI Beta Reader Database Schema
--- Run this once in your Neon console or any SQL client
+-- Migration: Add AI Profiles and Chapter Reviews
+-- Run this script to add the new tables to your existing database
 
--- Users table to store Auth0 user data
-CREATE TABLE IF NOT EXISTS users (
-  id SERIAL PRIMARY KEY,
-  auth0_sub TEXT UNIQUE NOT NULL,
-  email TEXT NOT NULL,
-  email_verified BOOLEAN DEFAULT FALSE,
-  username TEXT,
-  name TEXT,
-  created_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS books (
-  id TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  created_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS chapters (
-  id TEXT PRIMARY KEY,           -- e.g. "ch-12"
-  book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-  title TEXT,
-  text TEXT NOT NULL,
-  word_count INT,
-  created_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS chapter_summaries (
-  chapter_id TEXT PRIMARY KEY REFERENCES chapters(id) ON DELETE CASCADE,
-  pov TEXT,
-  characters JSONB,
-  beats JSONB,
-  spoilers_ok BOOLEAN,
-  summary TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT now()
-);
+-- Create a system user for default AI profiles if it doesn't exist
+INSERT INTO users (auth0_sub, email, email_verified, name) VALUES
+('system', 'system@ai-beta-reader.com', true, 'System')
+ON CONFLICT (auth0_sub) DO NOTHING;
 
 -- AI Profiles for different reviewer personalities
 CREATE TABLE IF NOT EXISTS ai_profiles (
@@ -66,22 +31,12 @@ CREATE TABLE IF NOT EXISTS chapter_reviews (
   UNIQUE(chapter_id, ai_profile_id)     -- One review per chapter per AI profile
 );
 
--- Helpful indexes
-CREATE INDEX IF NOT EXISTS idx_users_auth0_sub ON users(auth0_sub);
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-CREATE INDEX IF NOT EXISTS idx_books_user_id ON books(user_id);
-CREATE INDEX IF NOT EXISTS idx_chapters_book ON chapters(book_id);
-CREATE INDEX IF NOT EXISTS idx_summaries_created ON chapter_summaries(created_at DESC);
+-- Create indexes for performance
 CREATE INDEX IF NOT EXISTS idx_ai_profiles_user ON ai_profiles(user_id);
 CREATE INDEX IF NOT EXISTS idx_ai_profiles_tone ON ai_profiles(tone_key);
 CREATE INDEX IF NOT EXISTS idx_reviews_chapter ON chapter_reviews(chapter_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_profile ON chapter_reviews(ai_profile_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_created ON chapter_reviews(created_at DESC);
-
--- Create a system user for default AI profiles
-INSERT INTO users (auth0_sub, email, email_verified, name) VALUES
-('system', 'system@ai-beta-reader.com', true, 'System')
-ON CONFLICT (auth0_sub) DO NOTHING;
 
 -- Insert default system AI profiles
 INSERT INTO ai_profiles (user_id, name, tone_key, system_prompt, is_system)
@@ -93,3 +48,14 @@ FROM users u, (VALUES
 ) AS p(name, tone_key, system_prompt, is_system)
 WHERE u.auth0_sub = 'system'
 ON CONFLICT (user_id, tone_key) DO NOTHING;
+
+-- Verify the migration
+SELECT 'Migration complete! Created tables:' as message;
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'public'
+AND table_name IN ('ai_profiles', 'chapter_reviews')
+ORDER BY table_name;
+
+-- Show the default AI profiles
+SELECT 'Default AI profiles created:' as message;
+SELECT name, tone_key, is_system FROM ai_profiles WHERE is_system = true;
