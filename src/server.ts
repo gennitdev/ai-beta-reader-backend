@@ -24,7 +24,8 @@ const UpsertChapter = z.object({
 const ReviewReq = z.object({
   bookId: z.string().min(1),
   newChapterId: z.string().min(1),
-  tone: z.enum(["fanficnet","editorial","line-notes"]).optional()
+  tone: z.enum(["fanficnet","editorial","line-notes"]).optional(),
+  customProfileId: z.number().optional()
 });
 const CreateAIProfile = z.object({
   name: z.string().min(1),
@@ -36,6 +37,14 @@ const UpdateAIProfile = z.object({
   name: z.string().min(1).optional(),
   system_prompt: z.string().min(1).optional(),
   is_default: z.boolean().optional()
+});
+const CreateCustomReviewerProfile = z.object({
+  name: z.string().min(1).max(100),
+  description: z.string().min(1)
+});
+const UpdateCustomReviewerProfile = z.object({
+  name: z.string().min(1).max(100).optional(),
+  description: z.string().min(1).optional()
 });
 const CreateWikiPage = z.object({
   page_name: z.string().min(1),
@@ -735,12 +744,20 @@ app.get("/chapters/:id/reviews", authenticateJWT, async (req: AuthenticatedReque
       return res.status(403).json({ error: "You don't have permission to access this chapter" });
     }
 
-    // Get all reviews for this chapter
+    // Get all reviews for this chapter (both AI profiles and custom profiles)
     const { rows } = await pool.query(
       `SELECT r.id, r.review_text, r.created_at, r.updated_at,
-              p.id as profile_id, p.name as profile_name, p.tone_key
+              CASE
+                WHEN r.ai_profile_id IS NOT NULL THEN r.ai_profile_id::text
+                WHEN r.custom_profile_id IS NOT NULL THEN 'custom-' || r.custom_profile_id::text
+                ELSE NULL
+              END as profile_id,
+              COALESCE(p.name, cp.name) as profile_name,
+              p.tone_key,
+              CASE WHEN cp.id IS NOT NULL THEN true ELSE false END as is_custom
        FROM chapter_reviews r
-       JOIN ai_profiles p ON r.ai_profile_id = p.id
+       LEFT JOIN ai_profiles p ON r.ai_profile_id = p.id
+       LEFT JOIN custom_reviewer_profiles cp ON r.custom_profile_id = cp.id
        WHERE r.chapter_id = $1
        ORDER BY r.created_at DESC`,
       [chapterId]
@@ -796,7 +813,8 @@ app.delete("/reviews/:id", authenticateJWT, async (req: AuthenticatedRequest, re
 // Create a chapter-specific review with all prior summaries
 app.post("/reviews", authenticateJWT, async (req: AuthenticatedRequest, res, next) => {
   try {
-    const { bookId, newChapterId, tone = "fanficnet" } = ReviewReq.parse(req.body);
+    console.log("Review request body:", JSON.stringify(req.body, null, 2));
+    const { bookId, newChapterId, tone = "fanficnet", customProfileId } = ReviewReq.parse(req.body);
 
     if (!req.user) {
       return res.status(401).json({ error: "User not authenticated" });
@@ -835,21 +853,41 @@ app.post("/reviews", authenticateJWT, async (req: AuthenticatedRequest, res, nex
     if (!targetRows.length) return res.status(404).json({ error: "New chapter not found" });
     const target = targetRows[0];
 
-    // Get AI profile for the requested tone
-    const { rows: profileRows } = await pool.query(
-      `SELECT id, system_prompt
-       FROM ai_profiles
-       WHERE (user_id = $1 OR is_system = true) AND tone_key = $2
-       ORDER BY is_system ASC
-       LIMIT 1`,
-      [dbUser.id, tone]
-    );
+    // Get AI profile - either custom profile or built-in tone
+    let aiProfile;
+    if (customProfileId) {
+      // Using custom profile
+      const { rows: customProfileRows } = await pool.query(
+        `SELECT id, name, description
+         FROM custom_reviewer_profiles
+         WHERE id = $1 AND user_id = $2`,
+        [customProfileId, dbUser.id]
+      );
+      if (!customProfileRows.length) {
+        return res.status(404).json({ error: "Custom reviewer profile not found" });
+      }
+      // Use the description as the system prompt for custom profiles
+      aiProfile = {
+        id: `custom-${customProfileRows[0].id}`,
+        system_prompt: `You are a beta reader with this personality and approach: ${customProfileRows[0].description}. Please review the following chapter providing feedback in this style.`
+      };
+    } else {
+      // Using built-in tone
+      const { rows: profileRows } = await pool.query(
+        `SELECT id, system_prompt
+         FROM ai_profiles
+         WHERE (user_id = $1 OR is_system = true) AND tone_key = $2
+         ORDER BY is_system ASC
+         LIMIT 1`,
+        [dbUser.id, tone]
+      );
 
-    if (!profileRows.length) {
-      return res.status(404).json({ error: `AI profile not found for tone: ${tone}` });
+      if (!profileRows.length) {
+        return res.status(404).json({ error: `AI profile not found for tone: ${tone}` });
+      }
+
+      aiProfile = profileRows[0];
     }
-
-    const aiProfile = profileRows[0];
     const priorSummariesText = prior.map(r => `# ${r.id}${r.title ? ` — ${r.title}`:""}\n${r.summary}`).join("\n\n");
 
     const response = await openai.chat.completions.create({
@@ -867,13 +905,47 @@ app.post("/reviews", authenticateJWT, async (req: AuthenticatedRequest, res, nex
     const reviewText = response.choices[0]?.message?.content || "";
 
     // Save the review to the database
-    await pool.query(
-      `INSERT INTO chapter_reviews (chapter_id, ai_profile_id, review_text)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (chapter_id, ai_profile_id)
-       DO UPDATE SET review_text = EXCLUDED.review_text, updated_at = now()`,
-      [newChapterId, aiProfile.id, reviewText]
-    );
+    if (customProfileId) {
+      // Save custom profile review - first check if review exists
+      const { rows: existingReview } = await pool.query(
+        `SELECT id FROM chapter_reviews WHERE chapter_id = $1 AND custom_profile_id = $2`,
+        [newChapterId, customProfileId]
+      );
+
+      if (existingReview.length > 0) {
+        // Update existing review
+        await pool.query(
+          `UPDATE chapter_reviews SET review_text = $1, updated_at = now() WHERE id = $2`,
+          [reviewText, existingReview[0].id]
+        );
+      } else {
+        // Insert new review
+        await pool.query(
+          `INSERT INTO chapter_reviews (chapter_id, custom_profile_id, review_text) VALUES ($1, $2, $3)`,
+          [newChapterId, customProfileId, reviewText]
+        );
+      }
+    } else {
+      // Save AI profile review - first check if review exists
+      const { rows: existingReview } = await pool.query(
+        `SELECT id FROM chapter_reviews WHERE chapter_id = $1 AND ai_profile_id = $2`,
+        [newChapterId, aiProfile.id]
+      );
+
+      if (existingReview.length > 0) {
+        // Update existing review
+        await pool.query(
+          `UPDATE chapter_reviews SET review_text = $1, updated_at = now() WHERE id = $2`,
+          [reviewText, existingReview[0].id]
+        );
+      } else {
+        // Insert new review
+        await pool.query(
+          `INSERT INTO chapter_reviews (chapter_id, ai_profile_id, review_text) VALUES ($1, $2, $3)`,
+          [newChapterId, aiProfile.id, reviewText]
+        );
+      }
+    }
 
     res.json({ ok: true, review: reviewText });
   } catch (e) { next(e); }
@@ -1635,6 +1707,141 @@ app.put("/books/:bookId/chapters/reorder", authenticateJWT, async (req: Authenti
   } catch (error) {
     console.error("Batch reorder error:", error);
     res.status(500).json({ error: "Failed to reorder chapters" });
+  }
+});
+
+// ---- Custom Reviewer Profiles Routes ----
+
+// GET /custom-reviewer-profiles - Get user's custom reviewer profiles
+app.get("/custom-reviewer-profiles", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = await getUserFromAuth0Sub(req.user!.sub);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT id, name, description, created_at, updated_at
+       FROM custom_reviewer_profiles
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [user.id]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Get custom reviewer profiles error:", error);
+    res.status(500).json({ error: "Failed to get custom reviewer profiles" });
+  }
+});
+
+// POST /custom-reviewer-profiles - Create a new custom reviewer profile
+app.post("/custom-reviewer-profiles", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const body = CreateCustomReviewerProfile.parse(req.body);
+    const user = await getUserFromAuth0Sub(req.user!.sub);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO custom_reviewer_profiles (user_id, name, description)
+       VALUES ($1, $2, $3)
+       RETURNING id, name, description, created_at, updated_at`,
+      [user.id, body.name, body.description]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Create custom reviewer profile error:", error);
+    if (error instanceof Error && error.message.includes('duplicate key')) {
+      res.status(409).json({ error: "A profile with this name already exists" });
+    } else {
+      res.status(500).json({ error: "Failed to create custom reviewer profile" });
+    }
+  }
+});
+
+// PUT /custom-reviewer-profiles/:id - Update a custom reviewer profile
+app.put("/custom-reviewer-profiles/:id", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const body = UpdateCustomReviewerProfile.parse(req.body);
+    const user = await getUserFromAuth0Sub(req.user!.sub);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Verify ownership
+    const ownershipCheck = await pool.query(
+      `SELECT id FROM custom_reviewer_profiles WHERE id = $1 AND user_id = $2`,
+      [req.params.id, user.id]
+    );
+
+    if (ownershipCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Custom reviewer profile not found" });
+    }
+
+    // Build update query dynamically
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+
+    if (body.name !== undefined) {
+      updates.push(`name = $${paramCount++}`);
+      values.push(body.name);
+    }
+    if (body.description !== undefined) {
+      updates.push(`description = $${paramCount++}`);
+      values.push(body.description);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No fields to update" });
+    }
+
+    values.push(req.params.id);
+    const result = await pool.query(
+      `UPDATE custom_reviewer_profiles
+       SET ${updates.join(', ')}
+       WHERE id = $${paramCount}
+       RETURNING id, name, description, created_at, updated_at`,
+      values
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Update custom reviewer profile error:", error);
+    if (error instanceof Error && error.message.includes('duplicate key')) {
+      res.status(409).json({ error: "A profile with this name already exists" });
+    } else {
+      res.status(500).json({ error: "Failed to update custom reviewer profile" });
+    }
+  }
+});
+
+// DELETE /custom-reviewer-profiles/:id - Delete a custom reviewer profile
+app.delete("/custom-reviewer-profiles/:id", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = await getUserFromAuth0Sub(req.user!.sub);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const result = await pool.query(
+      `DELETE FROM custom_reviewer_profiles
+       WHERE id = $1 AND user_id = $2
+       RETURNING id`,
+      [req.params.id, user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Custom reviewer profile not found" });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Delete custom reviewer profile error:", error);
+    res.status(500).json({ error: "Failed to delete custom reviewer profile" });
   }
 });
 
