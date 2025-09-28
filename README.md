@@ -89,7 +89,7 @@ curl http://localhost:3001/books/nightshades/chapters
 
 ## Review Tones
 
-- `fanficnet` - Enthusiastic serial reader (default)
+- `fanficnet` - Enthusiastic fan style reader (default)
 - `editorial` - Developmental editor with actionable notes
 - `line-notes` - Line editor with concrete suggestions
 
