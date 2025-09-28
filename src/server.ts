@@ -2,8 +2,8 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { z } from "zod";
-import { pool, withTx } from "./db";
-import { openai } from "./openai";
+import { pool, withTx } from "./db.js";
+import { openai } from "./openai.js";
 
 const app = express();
 app.use(cors());
