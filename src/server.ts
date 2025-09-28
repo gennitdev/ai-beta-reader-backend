@@ -37,6 +37,24 @@ const UpdateAIProfile = z.object({
   system_prompt: z.string().min(1).optional(),
   is_default: z.boolean().optional()
 });
+const CreateWikiPage = z.object({
+  page_name: z.string().min(1),
+  page_type: z.enum(['character', 'location', 'concept', 'other']).optional(),
+  content: z.string().optional(),
+  summary: z.string().optional(),
+  aliases: z.array(z.string()).optional(),
+  tags: z.array(z.string()).optional(),
+  is_major: z.boolean().optional()
+});
+const UpdateWikiPage = z.object({
+  page_name: z.string().min(1).optional(),
+  page_type: z.enum(['character', 'location', 'concept', 'other']).optional(),
+  content: z.string().optional(),
+  summary: z.string().optional(),
+  aliases: z.array(z.string()).optional(),
+  tags: z.array(z.string()).optional(),
+  is_major: z.boolean().optional()
+});
 
 // ---- Auth routes
 app.post("/auth/profile", authenticateJWT, async (req: AuthenticatedRequest, res) => {
@@ -272,9 +290,172 @@ app.post("/chapters/:id/summary", authenticateJWT, async (req: AuthenticatedRequ
        JSON.stringify(out.beats||[]), !!out.spoilers_ok, out.summary]
     );
 
+    // Update wiki pages for characters mentioned in this chapter
+    if (out.characters && out.characters.length > 0) {
+      await updateWikiPagesFromChapter(chapter.book_id, chapterId, out.characters, chapter.text, out.summary);
+    }
+
     res.json({ ok: true, summary: out });
   } catch (e) { next(e); }
 });
+
+// Helper function to update wiki pages from chapter summaries
+async function updateWikiPagesFromChapter(bookId: string, chapterId: string, characters: string[], chapterText: string, chapterSummary: string) {
+  try {
+    for (const characterName of characters) {
+      // Update or create book character entry first
+      await pool.query(
+        `INSERT INTO book_characters (book_id, character_name, first_mentioned_chapter, mention_count)
+         VALUES ($1, $2, $3, 1)
+         ON CONFLICT (book_id, character_name)
+         DO UPDATE SET
+           mention_count = book_characters.mention_count + 1,
+           updated_at = now()`,
+        [bookId, characterName, chapterId]
+      );
+      // Check if wiki page already exists for this character
+      const { rows: existingPages } = await pool.query(
+        'SELECT * FROM wiki_pages WHERE book_id = $1 AND page_name = $2',
+        [bookId, characterName]
+      );
+
+      let wikiPageId: number;
+      let isNewPage = false;
+
+      if (existingPages.length === 0) {
+        // Create new wiki page for this character
+        const newPageContent = await generateWikiContent(characterName, chapterText, chapterSummary, null);
+
+        const { rows: newPageRows } = await pool.query(
+          `INSERT INTO wiki_pages (book_id, page_name, page_type, content, summary, created_by_ai)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id`,
+          [bookId, characterName, 'character', newPageContent.content, newPageContent.summary, true]
+        );
+
+        wikiPageId = newPageRows[0].id;
+        isNewPage = true;
+
+        // Update book_characters to link to this wiki page
+        await pool.query(
+          `UPDATE book_characters SET has_wiki_page = true, wiki_page_id = $1
+           WHERE book_id = $2 AND character_name = $3`,
+          [wikiPageId, bookId, characterName]
+        );
+
+        // Log the creation
+        await pool.query(
+          `INSERT INTO wiki_updates (wiki_page_id, chapter_id, update_type, new_content, change_summary)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [wikiPageId, chapterId, 'created', newPageContent.content, `Created from chapter summary - first mention of ${characterName}`]
+        );
+      } else {
+        // Update existing wiki page
+        const existingPage = existingPages[0];
+        wikiPageId = existingPage.id;
+
+        const updatedContent = await generateWikiContent(characterName, chapterText, chapterSummary, existingPage.content);
+
+        if (updatedContent.hasChanges) {
+          await pool.query(
+            `UPDATE wiki_pages SET content = $1, summary = $2, updated_at = now()
+             WHERE id = $3`,
+            [updatedContent.content, updatedContent.summary, wikiPageId]
+          );
+
+          // Log the update
+          await pool.query(
+            `INSERT INTO wiki_updates (wiki_page_id, chapter_id, update_type, previous_content, new_content, change_summary, contradiction_notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              wikiPageId,
+              chapterId,
+              updatedContent.hasContradictions ? 'contradiction_noted' : 'updated',
+              existingPage.content,
+              updatedContent.content,
+              updatedContent.changeSummary,
+              updatedContent.contradictions || null
+            ]
+          );
+        }
+      }
+
+      // Record the mention in chapter_wiki_mentions
+      await pool.query(
+        `INSERT INTO chapter_wiki_mentions (chapter_id, wiki_page_id, mention_context)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (chapter_id, wiki_page_id)
+         DO UPDATE SET mention_context = EXCLUDED.mention_context`,
+        [chapterId, wikiPageId, `Mentioned in chapter summary: ${chapterSummary.substring(0, 100)}...`]
+      );
+    }
+  } catch (error) {
+    console.error('Error updating wiki pages from chapter:', error);
+    // Don't throw - we don't want wiki updates to fail the summary generation
+  }
+}
+
+// Generate or update wiki content using AI
+async function generateWikiContent(characterName: string, chapterText: string, chapterSummary: string, existingContent: string | null) {
+  try {
+    const isNewPage = !existingContent;
+
+    const systemPrompt = isNewPage
+      ? `You are a wiki editor creating a character page. Create a comprehensive character profile based on the information provided. Return JSON with: {content: "markdown content", summary: "brief summary", hasChanges: true}`
+      : `You are a wiki editor updating a character page. Compare the existing content with new information from the chapter. Update the wiki to include new information and note any contradictions. Return JSON with: {content: "updated markdown", summary: "updated summary", hasChanges: boolean, changeSummary: "what changed", hasContradictions: boolean, contradictions: "contradictions found"}`;
+
+    const userPrompt = isNewPage
+      ? `Create a wiki page for character: ${characterName}
+
+Chapter Summary: ${chapterSummary}
+
+Chapter Text Context: ${chapterText.substring(0, 2000)}...
+
+Create a character profile with sections for:
+- Basic Information
+- Appearance
+- Personality
+- Background
+- Relationships
+- Chapter Appearances`
+      : `Update the wiki page for character: ${characterName}
+
+EXISTING WIKI CONTENT:
+${existingContent}
+
+NEW CHAPTER INFORMATION:
+Chapter Summary: ${chapterSummary}
+Chapter Text Context: ${chapterText.substring(0, 2000)}...
+
+Update the wiki with any new information. If there are contradictions with existing content, note them clearly in a "Contradictions" section.`;
+
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.3
+    });
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) {
+      throw new Error("No content received from OpenAI for wiki generation");
+    }
+
+    return JSON.parse(content);
+  } catch (error) {
+    console.error('Error generating wiki content:', error);
+    // Return a basic fallback
+    return {
+      content: `# ${characterName}\n\nMentioned in chapter summary: ${chapterSummary}`,
+      summary: `Character from the story`,
+      hasChanges: true,
+      changeSummary: 'Basic wiki page created due to AI generation error'
+    };
+  }
+}
 
 // ---- AI Profiles routes
 app.get("/ai-profiles", authenticateJWT, async (req: AuthenticatedRequest, res) => {
@@ -656,7 +837,8 @@ app.get("/books/:id/chapters", authenticateJWT, async (req: AuthenticatedRequest
 
     const { rows } = await pool.query(`
       SELECT c.id, c.title, c.word_count,
-             CASE WHEN s.chapter_id IS NULL THEN false ELSE true END AS has_summary
+             CASE WHEN s.chapter_id IS NULL THEN false ELSE true END AS has_summary,
+             s.summary
         FROM chapters c
         LEFT JOIN chapter_summaries s ON s.chapter_id = c.id
        WHERE c.book_id=$1
@@ -705,6 +887,376 @@ app.get("/chapters/:id", authenticateJWT, async (req: AuthenticatedRequest, res)
   } catch (error) {
     console.error("Get chapter error:", error);
     res.status(500).json({ error: "Failed to get chapter" });
+  }
+});
+
+// ---- Character List routes
+app.get("/books/:id/characters", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const bookId = req.params.id;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book
+    const { rows: bookRows } = await pool.query(
+      'SELECT user_id FROM books WHERE id = $1',
+      [bookId]
+    );
+
+    if (!bookRows.length) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    if (bookRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to access this book" });
+    }
+
+    // Get all characters for this book
+    const { rows } = await pool.query(
+      `SELECT bc.*, wp.page_name as wiki_page_name
+       FROM book_characters bc
+       LEFT JOIN wiki_pages wp ON bc.wiki_page_id = wp.id
+       WHERE bc.book_id = $1
+       ORDER BY bc.mention_count DESC, bc.character_name`,
+      [bookId]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Get book characters error:", error);
+    res.status(500).json({ error: "Failed to get book characters" });
+  }
+});
+
+// ---- Wiki routes
+app.get("/books/:id/wiki", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const bookId = req.params.id;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book
+    const { rows: bookRows } = await pool.query(
+      'SELECT user_id FROM books WHERE id = $1',
+      [bookId]
+    );
+
+    if (!bookRows.length) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    if (bookRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to access this book" });
+    }
+
+    // Get all wiki pages for this book
+    const { rows } = await pool.query(
+      `SELECT id, page_name, page_type, summary, aliases, tags, is_major,
+              created_by_ai, created_at, updated_at,
+              LENGTH(content) as content_length
+       FROM wiki_pages
+       WHERE book_id = $1
+       ORDER BY is_major DESC, page_type, page_name`,
+      [bookId]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Get wiki pages error:", error);
+    res.status(500).json({ error: "Failed to get wiki pages" });
+  }
+});
+
+app.get("/wiki/:id", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const wikiPageId = req.params.id;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Get wiki page with book ownership verification
+    const { rows } = await pool.query(
+      `SELECT w.*, b.user_id
+       FROM wiki_pages w
+       JOIN books b ON w.book_id = b.id
+       WHERE w.id = $1`,
+      [wikiPageId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "Wiki page not found" });
+    }
+
+    const wikiPage = rows[0];
+
+    // Verify user owns the book
+    if (wikiPage.user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to access this wiki page" });
+    }
+
+    // Remove user_id from response
+    const { user_id, ...responseData } = wikiPage;
+    res.json(responseData);
+  } catch (error) {
+    console.error("Get wiki page error:", error);
+    res.status(500).json({ error: "Failed to get wiki page" });
+  }
+});
+
+app.post("/books/:id/wiki", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const bookId = req.params.id;
+    const data = CreateWikiPage.parse(req.body);
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book
+    const { rows: bookRows } = await pool.query(
+      'SELECT user_id FROM books WHERE id = $1',
+      [bookId]
+    );
+
+    if (!bookRows.length) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    if (bookRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to access this book" });
+    }
+
+    // Create wiki page
+    const { rows } = await pool.query(
+      `INSERT INTO wiki_pages (book_id, page_name, page_type, content, summary, aliases, tags, is_major)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        bookId,
+        data.page_name,
+        data.page_type || 'character',
+        data.content || '',
+        data.summary || null,
+        JSON.stringify(data.aliases || []),
+        JSON.stringify(data.tags || []),
+        data.is_major || false
+      ]
+    );
+
+    res.json({ ok: true, page: rows[0] });
+  } catch (error) {
+    console.error("Create wiki page error:", error);
+    res.status(500).json({ error: "Failed to create wiki page" });
+  }
+});
+
+app.put("/wiki/:id", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const wikiPageId = req.params.id;
+    const data = UpdateWikiPage.parse(req.body);
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book and get current content for audit log
+    const { rows: wikiRows } = await pool.query(
+      `SELECT w.*, b.user_id
+       FROM wiki_pages w
+       JOIN books b ON w.book_id = b.id
+       WHERE w.id = $1`,
+      [wikiPageId]
+    );
+
+    if (!wikiRows.length) {
+      return res.status(404).json({ error: "Wiki page not found" });
+    }
+
+    const currentPage = wikiRows[0];
+
+    if (currentPage.user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to edit this wiki page" });
+    }
+
+    // Build dynamic update query
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (data.page_name !== undefined) {
+      updates.push(`page_name = $${paramIndex++}`);
+      values.push(data.page_name);
+    }
+    if (data.page_type !== undefined) {
+      updates.push(`page_type = $${paramIndex++}`);
+      values.push(data.page_type);
+    }
+    if (data.content !== undefined) {
+      updates.push(`content = $${paramIndex++}`);
+      values.push(data.content);
+    }
+    if (data.summary !== undefined) {
+      updates.push(`summary = $${paramIndex++}`);
+      values.push(data.summary);
+    }
+    if (data.aliases !== undefined) {
+      updates.push(`aliases = $${paramIndex++}`);
+      values.push(JSON.stringify(data.aliases));
+    }
+    if (data.tags !== undefined) {
+      updates.push(`tags = $${paramIndex++}`);
+      values.push(JSON.stringify(data.tags));
+    }
+    if (data.is_major !== undefined) {
+      updates.push(`is_major = $${paramIndex++}`);
+      values.push(data.is_major);
+    }
+
+    updates.push(`updated_at = now()`);
+    values.push(wikiPageId);
+
+    const { rows } = await pool.query(
+      `UPDATE wiki_pages SET ${updates.join(', ')}
+       WHERE id = $${paramIndex}
+       RETURNING *`,
+      values
+    );
+
+    // Log the update in wiki_updates table
+    if (data.content !== undefined && data.content !== currentPage.content) {
+      await pool.query(
+        `INSERT INTO wiki_updates (wiki_page_id, update_type, previous_content, new_content, change_summary)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          wikiPageId,
+          'manual_edit',
+          currentPage.content,
+          data.content,
+          'Manual edit by user'
+        ]
+      );
+    }
+
+    res.json({ ok: true, page: rows[0] });
+  } catch (error) {
+    console.error("Update wiki page error:", error);
+    res.status(500).json({ error: "Failed to update wiki page" });
+  }
+});
+
+app.delete("/wiki/:id", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const wikiPageId = req.params.id;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book
+    const { rows: wikiRows } = await pool.query(
+      `SELECT w.id, b.user_id
+       FROM wiki_pages w
+       JOIN books b ON w.book_id = b.id
+       WHERE w.id = $1`,
+      [wikiPageId]
+    );
+
+    if (!wikiRows.length) {
+      return res.status(404).json({ error: "Wiki page not found" });
+    }
+
+    if (wikiRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to delete this wiki page" });
+    }
+
+    await pool.query('DELETE FROM wiki_pages WHERE id = $1', [wikiPageId]);
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Delete wiki page error:", error);
+    res.status(500).json({ error: "Failed to delete wiki page" });
+  }
+});
+
+app.get("/wiki/:id/history", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const wikiPageId = req.params.id;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the book
+    const { rows: wikiRows } = await pool.query(
+      `SELECT w.id, b.user_id
+       FROM wiki_pages w
+       JOIN books b ON w.book_id = b.id
+       WHERE w.id = $1`,
+      [wikiPageId]
+    );
+
+    if (!wikiRows.length) {
+      return res.status(404).json({ error: "Wiki page not found" });
+    }
+
+    if (wikiRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to access this wiki page" });
+    }
+
+    // Get update history
+    const { rows } = await pool.query(
+      `SELECT wu.*, c.title as chapter_title
+       FROM wiki_updates wu
+       LEFT JOIN chapters c ON wu.chapter_id = c.id
+       WHERE wu.wiki_page_id = $1
+       ORDER BY wu.created_at DESC`,
+      [wikiPageId]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Get wiki history error:", error);
+    res.status(500).json({ error: "Failed to get wiki history" });
   }
 });
 
