@@ -68,12 +68,12 @@ app.post("/chapters/:id/summary", async (req, res, next) => {
     if (!rows.length) return res.status(404).json({ error: "Chapter not found" });
     const chapter = rows[0];
 
-    // call Responses API with JSON schema
-    const response = await openai.responses.create({
-      model: "GPT-5", // or 'gpt-5' depending on casing in your SDK's catalog
-      input: [
+    // call OpenAI Chat Completions API with JSON mode
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini", // Use a model that supports JSON mode
+      messages: [
         { role: "system", content:
-          "You are an expert fiction editor. Produce a tight factual summary (150–250 words), include POV, main characters, and 4–8 bullet beats. No speculation."},
+          "You are an expert fiction editor. Produce a tight factual summary (150–250 words), include POV, main characters, and 4–8 bullet beats. No speculation. Return valid JSON only."},
         { role: "user", content:
           `Book: ${chapter.book_title} (${chapter.book_id})\n` +
           `Chapter: ${chapter.id}${chapter.title ? ` — ${chapter.title}` : ""}\n\n` +
@@ -81,27 +81,15 @@ app.post("/chapters/:id/summary", async (req, res, next) => {
           chapter.text
         }
       ],
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "ChapterSummary",
-          schema: {
-            type: "object",
-            properties: {
-              pov: { type: "string" },
-              characters: { type: "array", items: { type: "string" } },
-              beats: { type: "array", items: { type: "string" }, minItems: 4 },
-              spoilers_ok: { type: "boolean" },
-              summary: { type: "string" }
-            },
-            required: ["pov","characters","beats","spoilers_ok","summary"],
-            additionalProperties: false
-          }
-        }
-      }
+      response_format: { type: "json_object" },
+      temperature: 0.3
     });
 
-    const out = JSON.parse(response.output_text!);
+    const content = response.choices[0].message.content;
+    if (!content) {
+      throw new Error("No content received from OpenAI");
+    }
+    const out = JSON.parse(content);
 
     await pool.query(
       `INSERT INTO chapter_summaries (chapter_id, pov, characters, beats, spoilers_ok, summary)
@@ -149,18 +137,19 @@ app.post("/reviews", async (req, res, next) => {
         ? "You are a concise developmental editor. Give specific, actionable notes about structure, character, pacing, and continuity for THIS chapter in context."
         : "You are a line editor. Provide concrete line-level suggestions with examples.";
 
-    const response = await openai.responses.create({
-      model: "GPT-5",
-      input: [
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
         { role: "system", content: system },
         { role: "user", content:
           `PRIOR CHAPTER SUMMARIES:\n${priorSummariesText}\n\n` +
           `NEW CHAPTER: ${target.id}${target.title ? ` — ${target.title}` : ""}\n${target.text}\n\n` +
           "Write the review now." }
-      ]
+      ],
+      temperature: 0.7
     });
 
-    res.json({ ok: true, review: response.output_text });
+    res.json({ ok: true, review: response.choices[0].message.content });
   } catch (e) { next(e); }
 });
 
