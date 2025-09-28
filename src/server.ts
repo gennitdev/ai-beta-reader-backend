@@ -158,7 +158,8 @@ app.get("/books", authenticateJWT, async (req: AuthenticatedRequest, res) => {
 
     const { rows } = await pool.query(
       `SELECT b.id, b.title, b.created_at, b.updated_at,
-              COUNT(c.id) as chapter_count
+              COUNT(c.id) as chapter_count,
+              COALESCE(SUM(array_length(string_to_array(c.text, ' '), 1)), 0) as total_word_count
        FROM books b
        LEFT JOIN chapters c ON c.book_id = b.id
        WHERE b.user_id = $1
