@@ -99,6 +99,7 @@ app.post("/books", authenticateJWT, async (req: AuthenticatedRequest, res) => {
       return res.status(404).json({ error: "User profile not found. Please create your profile first." });
     }
 
+
     await pool.query(
       `INSERT INTO books(id, title, user_id, created_at, updated_at)
        VALUES ($1, $2, $3, now(), now())
