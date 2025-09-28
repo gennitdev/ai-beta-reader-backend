@@ -15,6 +15,11 @@ A REST API for getting AI-generated feedback on chapters with context from previ
    OPENAI_API_KEY=sk-...
    DATABASE_URL=postgres://USER:PASS@HOST/DBNAME?sslmode=require
    PORT=3001
+
+   # Auth0 Configuration
+   AUTH0_DOMAIN=your-auth0-domain.auth0.com
+   AUTH0_CLIENT_ID=your-auth0-client-id
+   AUTH0_AUDIENCE=your-auth0-audience
    ```
 
 3. **Set up database:**
@@ -30,7 +35,14 @@ A REST API for getting AI-generated feedback on chapters with context from previ
 
 ## API Endpoints
 
+**Note:** All endpoints except authentication routes require a valid Auth0 JWT token in the Authorization header.
+
+### Authentication
+- `POST /auth/profile` - Create/update user profile
+- `GET /auth/me` - Get current user profile
+
 ### Books
+- `GET /books` - Get user's books
 - `POST /books` - Create/register a book
 - `GET /books/:id/chapters` - List chapters (+ whether summarized)
 
