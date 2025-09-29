@@ -794,7 +794,7 @@ app.get("/chapters/:id/reviews", authenticateJWT, async (req: AuthenticatedReque
 
     // Get all reviews for this chapter (both AI profiles and custom profiles)
     const { rows } = await pool.query(
-      `SELECT r.id, r.review_text, r.created_at, r.updated_at,
+      `SELECT r.id, r.review_text, r.prompt_used, r.created_at, r.updated_at,
               CASE
                 WHEN r.ai_profile_id IS NOT NULL THEN r.ai_profile_id::text
                 WHEN r.custom_profile_id IS NOT NULL THEN 'custom-' || r.custom_profile_id::text
@@ -938,14 +938,18 @@ app.post("/reviews", authenticateJWT, async (req: AuthenticatedRequest, res, nex
     }
     const priorSummariesText = prior.map(r => `# ${r.id}${r.title ? ` — ${r.title}`:""}\n${r.summary}`).join("\n\n");
 
+    const userPrompt = `PRIOR CHAPTER SUMMARIES:\n${priorSummariesText}\n\n` +
+      `NEW CHAPTER: ${target.id}${target.title ? ` — ${target.title}` : ""}\n${target.text}\n\n` +
+      "Write the review now.";
+
+    // Store the full prompt for transparency
+    const fullPrompt = `SYSTEM PROMPT:\n${aiProfile.system_prompt}\n\nUSER PROMPT:\n${userPrompt}`;
+
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         { role: "system", content: aiProfile.system_prompt },
-        { role: "user", content:
-          `PRIOR CHAPTER SUMMARIES:\n${priorSummariesText}\n\n` +
-          `NEW CHAPTER: ${target.id}${target.title ? ` — ${target.title}` : ""}\n${target.text}\n\n` +
-          "Write the review now." }
+        { role: "user", content: userPrompt }
       ],
       temperature: 0.7
     });
@@ -963,14 +967,14 @@ app.post("/reviews", authenticateJWT, async (req: AuthenticatedRequest, res, nex
       if (existingReview.length > 0) {
         // Update existing review
         await pool.query(
-          `UPDATE chapter_reviews SET review_text = $1, updated_at = now() WHERE id = $2`,
-          [reviewText, existingReview[0].id]
+          `UPDATE chapter_reviews SET review_text = $1, prompt_used = $2, updated_at = now() WHERE id = $3`,
+          [reviewText, fullPrompt, existingReview[0].id]
         );
       } else {
         // Insert new review
         await pool.query(
-          `INSERT INTO chapter_reviews (chapter_id, custom_profile_id, review_text) VALUES ($1, $2, $3)`,
-          [newChapterId, customProfileId, reviewText]
+          `INSERT INTO chapter_reviews (chapter_id, custom_profile_id, review_text, prompt_used) VALUES ($1, $2, $3, $4)`,
+          [newChapterId, customProfileId, reviewText, fullPrompt]
         );
       }
     } else {
@@ -983,14 +987,14 @@ app.post("/reviews", authenticateJWT, async (req: AuthenticatedRequest, res, nex
       if (existingReview.length > 0) {
         // Update existing review
         await pool.query(
-          `UPDATE chapter_reviews SET review_text = $1, updated_at = now() WHERE id = $2`,
-          [reviewText, existingReview[0].id]
+          `UPDATE chapter_reviews SET review_text = $1, prompt_used = $2, updated_at = now() WHERE id = $3`,
+          [reviewText, fullPrompt, existingReview[0].id]
         );
       } else {
         // Insert new review
         await pool.query(
-          `INSERT INTO chapter_reviews (chapter_id, ai_profile_id, review_text) VALUES ($1, $2, $3)`,
-          [newChapterId, aiProfile.id, reviewText]
+          `INSERT INTO chapter_reviews (chapter_id, ai_profile_id, review_text, prompt_used) VALUES ($1, $2, $3, $4)`,
+          [newChapterId, aiProfile.id, reviewText, fullPrompt]
         );
       }
     }
