@@ -327,6 +327,54 @@ app.post("/chapters/:id/summary", authenticateJWT, async (req: AuthenticatedRequ
   } catch (e) { next(e); }
 });
 
+// Update chapter summary manually
+app.put("/chapters/:id/summary", authenticateJWT, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const chapterId = req.params.id;
+    const { summary } = req.body;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    if (!summary || typeof summary !== 'string') {
+      return res.status(400).json({ error: "Summary is required and must be a string" });
+    }
+
+    const dbUser = await getUserFromAuth0Sub(req.user.sub);
+    if (!dbUser) {
+      return res.status(404).json({ error: "User profile not found" });
+    }
+
+    // Verify user owns the chapter
+    const { rows: chapterRows } = await pool.query(
+      `SELECT c.id, b.user_id
+       FROM chapters c
+       JOIN books b ON c.book_id = b.id
+       WHERE c.id = $1`,
+      [chapterId]
+    );
+
+    if (!chapterRows.length) {
+      return res.status(404).json({ error: "Chapter not found" });
+    }
+
+    if (chapterRows[0].user_id !== dbUser.id) {
+      return res.status(403).json({ error: "You don't have permission to edit this chapter" });
+    }
+
+    // Update just the summary field
+    await pool.query(
+      `UPDATE chapter_summaries
+       SET summary = $1, created_at = now()
+       WHERE chapter_id = $2`,
+      [summary, chapterId]
+    );
+
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
 // Helper function to update wiki pages from chapter summaries
 async function updateWikiPagesFromChapter(bookId: string, chapterId: string, characters: string[], chapterText: string, chapterSummary: string) {
   try {
