@@ -1958,6 +1958,158 @@ app.delete("/custom-reviewer-profiles/:id", authenticateJWT, async (req: Authent
   }
 });
 
+// ---- Search endpoints
+app.get("/books/:bookId/search", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const bookId = req.params.bookId;
+    const query = req.query.q as string;
+
+    if (!query || query.trim().length === 0) {
+      return res.json({ chapters: [], wikiPages: [] });
+    }
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const user = await getUserFromAuth0Sub(req.user.sub);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const searchTerm = `%${query.toLowerCase()}%`;
+
+    // Search chapters
+    const chapterResults = await pool.query(`
+      SELECT c.id, c.title, c.text, c.word_count,
+             array_position(b.chapter_order, c.id) as position
+      FROM chapters c
+      JOIN books b ON c.book_id = b.id
+      WHERE b.id = $1 AND b.user_id = $2 AND LOWER(c.text) LIKE $3
+      ORDER BY array_position(b.chapter_order, c.id)
+    `, [bookId, user.id, searchTerm]);
+
+    // Search wiki pages
+    const wikiResults = await pool.query(`
+      SELECT wp.id, wp.page_name, wp.content, wp.summary, wp.page_type
+      FROM wiki_pages wp
+      WHERE wp.book_id = $1 AND (
+        LOWER(wp.content) LIKE $2 OR
+        LOWER(wp.summary) LIKE $2 OR
+        LOWER(wp.page_name) LIKE $2
+      )
+      ORDER BY wp.page_name
+    `, [bookId, searchTerm]);
+
+    res.json({
+      chapters: chapterResults.rows,
+      wikiPages: wikiResults.rows
+    });
+  } catch (error) {
+    console.error("Search error:", error);
+    res.status(500).json({ error: "Failed to search book" });
+  }
+});
+
+app.post("/chapters/:chapterId/replace", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const chapterId = req.params.chapterId;
+    const { searchTerm, replaceTerm } = req.body;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const user = await getUserFromAuth0Sub(req.user.sub);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Verify ownership
+    const chapter = await pool.query(`
+      SELECT c.id, c.text, c.book_id
+      FROM chapters c
+      JOIN books b ON c.book_id = b.id
+      WHERE c.id = $1 AND b.user_id = $2
+    `, [chapterId, user.id]);
+
+    if (chapter.rows.length === 0) {
+      return res.status(404).json({ error: "Chapter not found" });
+    }
+
+    // Perform replacement
+    const updatedText = chapter.rows[0].text.replace(new RegExp(escapeRegExp(searchTerm), 'gi'), replaceTerm);
+    const wordCount = updatedText.split(/\s+/).filter(word => word.length > 0).length;
+
+    await pool.query(`
+      UPDATE chapters
+      SET text = $1, word_count = $2, updated_at = NOW()
+      WHERE id = $3
+    `, [updatedText, wordCount, chapterId]);
+
+    res.json({ success: true, updatedText, wordCount });
+  } catch (error) {
+    console.error("Replace in chapter error:", error);
+    res.status(500).json({ error: "Failed to replace text in chapter" });
+  }
+});
+
+app.post("/wiki/:wikiPageId/replace", authenticateJWT, async (req: AuthenticatedRequest, res) => {
+  try {
+    const wikiPageId = req.params.wikiPageId;
+    const { searchTerm, replaceTerm } = req.body;
+
+    if (!req.user) {
+      return res.status(401).json({ error: "User not authenticated" });
+    }
+
+    const user = await getUserFromAuth0Sub(req.user.sub);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Verify ownership
+    const wikiPage = await pool.query(`
+      SELECT wp.id, wp.content, wp.summary, wp.page_name
+      FROM wiki_pages wp
+      JOIN books b ON wp.book_id = b.id
+      WHERE wp.id = $1 AND b.user_id = $2
+    `, [wikiPageId, user.id]);
+
+    if (wikiPage.rows.length === 0) {
+      return res.status(404).json({ error: "Wiki page not found" });
+    }
+
+    const page = wikiPage.rows[0];
+
+    // Perform replacement in content, summary, and page name
+    const updatedContent = page.content ? page.content.replace(new RegExp(escapeRegExp(searchTerm), 'gi'), replaceTerm) : page.content;
+    const updatedSummary = page.summary ? page.summary.replace(new RegExp(escapeRegExp(searchTerm), 'gi'), replaceTerm) : page.summary;
+    const updatedPageName = page.page_name.replace(new RegExp(escapeRegExp(searchTerm), 'gi'), replaceTerm);
+
+    await pool.query(`
+      UPDATE wiki_pages
+      SET content = $1, summary = $2, page_name = $3, updated_at = NOW()
+      WHERE id = $4
+    `, [updatedContent, updatedSummary, updatedPageName, wikiPageId]);
+
+    res.json({
+      success: true,
+      updatedContent,
+      updatedSummary,
+      updatedPageName
+    });
+  } catch (error) {
+    console.error("Replace in wiki page error:", error);
+    res.status(500).json({ error: "Failed to replace text in wiki page" });
+  }
+});
+
+// Helper function to escape regex special characters
+function escapeRegExp(string: string): string {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 app.listen(process.env.PORT || 3001, () => {
   console.log(`AI Beta Reader API listening on http://localhost:${process.env.PORT || 3001}`);
 });
