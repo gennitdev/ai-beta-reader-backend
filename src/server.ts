@@ -212,23 +212,28 @@ app.post("/chapters", authenticateJWT, async (req: AuthenticatedRequest, res) =>
       return res.status(403).json({ error: "You don't have permission to add chapters to this book" });
     }
 
-    // Get the next position for new chapters
-    const { rows: positionRows } = await pool.query(
-      'SELECT COALESCE(MAX(position), -1) + 1 as next_position FROM chapters WHERE book_id = $1',
-      [data.bookId]
-    );
-    const nextPosition = positionRows[0].next_position;
-
+    // Insert or update chapter (no position fields needed)
     await pool.query(
-      `INSERT INTO chapters(id, book_id, title, text, word_count, position, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6, now())
+      `INSERT INTO chapters(id, book_id, title, text, word_count, updated_at)
+       VALUES ($1,$2,$3,$4,$5, now())
        ON CONFLICT (id) DO UPDATE SET
          book_id=EXCLUDED.book_id,
          title=EXCLUDED.title,
          text=EXCLUDED.text,
          word_count=EXCLUDED.word_count,
          updated_at=now()`,
-      [data.id, data.bookId, data.title ?? null, data.text, wordCount, nextPosition]
+      [data.id, data.bookId, data.title ?? null, data.text, wordCount]
+    );
+
+    // Add new chapter to the end of book's chapter_order array (only if not already present)
+    await pool.query(
+      `UPDATE books
+       SET chapter_order = CASE
+         WHEN $2 = ANY(chapter_order) THEN chapter_order
+         ELSE array_append(chapter_order, $2)
+       END
+       WHERE id = $1`,
+      [data.bookId, data.id]
     );
 
     res.json({ ok: true, wordCount });
@@ -1029,15 +1034,18 @@ app.get("/books/:id/chapters", authenticateJWT, async (req: AuthenticatedRequest
     }
 
     const { rows } = await pool.query(`
-      SELECT c.id, c.title, c.word_count, c.position, c.part_id,
+      SELECT c.id, c.title, c.word_count, c.part_id,
              CASE WHEN s.chapter_id IS NULL THEN false ELSE true END AS has_summary,
              s.summary,
-             p.name as part_name, p.position as part_position
+             p.name as part_name,
+             array_position(b.chapter_order, c.id) as position,
+             array_position(p.chapter_order, c.id) as position_in_part
         FROM chapters c
         LEFT JOIN chapter_summaries s ON s.chapter_id = c.id
         LEFT JOIN book_parts p ON c.part_id = p.id
+        JOIN books b ON c.book_id = b.id
        WHERE c.book_id=$1
-       ORDER BY COALESCE(p.position, 999999), c.position, c.id`, [req.params.id]);
+       ORDER BY array_position(b.chapter_order, c.id), c.id`, [req.params.id]);
 
     res.json(rows);
   } catch (error) {
@@ -1488,7 +1496,7 @@ app.get("/books/:bookId/parts", authenticateJWT, async (req: AuthenticatedReques
     }
 
     const { rows } = await pool.query(
-      'SELECT id, name, position FROM book_parts WHERE book_id = $1 ORDER BY position',
+      'SELECT id, name, created_at FROM book_parts WHERE book_id = $1 ORDER BY created_at',
       [req.params.bookId]
     );
 
@@ -1527,8 +1535,8 @@ app.post("/books/:bookId/parts", authenticateJWT, async (req: AuthenticatedReque
     }
 
     const { rows } = await pool.query(
-      'INSERT INTO book_parts (book_id, name, position) VALUES ($1, $2, $3) RETURNING *',
-      [req.params.bookId, name, position ?? 0]
+      'INSERT INTO book_parts (book_id, name) VALUES ($1, $2) RETURNING *',
+      [req.params.bookId, name]
     );
 
     res.json(rows[0]);
@@ -1540,7 +1548,7 @@ app.post("/books/:bookId/parts", authenticateJWT, async (req: AuthenticatedReque
 
 app.put("/books/:bookId/parts/:partId", authenticateJWT, async (req: AuthenticatedRequest, res) => {
   try {
-    const { name, position } = req.body;
+    const { name } = req.body;
 
     if (!req.user) {
       return res.status(401).json({ error: "User not authenticated" });
@@ -1565,31 +1573,15 @@ app.put("/books/:bookId/parts/:partId", authenticateJWT, async (req: Authenticat
       return res.status(403).json({ error: "You don't have permission to modify this book" });
     }
 
-    const updates = [];
-    const values = [];
-    let paramCount = 1;
-
-    if (name !== undefined) {
-      updates.push(`name = $${paramCount++}`);
-      values.push(name);
+    if (!name) {
+      return res.status(400).json({ error: "Name is required" });
     }
-
-    if (position !== undefined) {
-      updates.push(`position = $${paramCount++}`);
-      values.push(position);
-    }
-
-    if (updates.length === 0) {
-      return res.status(400).json({ error: "No updates provided" });
-    }
-
-    values.push(req.params.partId, req.params.bookId);
 
     const { rows } = await pool.query(
-      `UPDATE book_parts SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $${paramCount} AND book_id = $${paramCount + 1}
+      `UPDATE book_parts SET name = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2 AND book_id = $3
        RETURNING *`,
-      values
+      [name, req.params.partId, req.params.bookId]
     );
 
     if (!rows.length) {
@@ -1653,7 +1645,10 @@ app.delete("/books/:bookId/parts/:partId", authenticateJWT, async (req: Authenti
 // Chapter Reordering
 app.put("/chapters/:chapterId/reorder", authenticateJWT, async (req: AuthenticatedRequest, res) => {
   try {
-    const { position, partId } = req.body;
+    const { partId, bookPosition, partPosition } = req.body;
+    // partId: which part to move to (null for uncategorized)
+    // bookPosition: position in global book order (optional)
+    // partPosition: position within the part (optional)
 
     if (!req.user) {
       return res.status(401).json({ error: "User not authenticated" });
@@ -1666,7 +1661,7 @@ app.put("/chapters/:chapterId/reorder", authenticateJWT, async (req: Authenticat
 
     // Get chapter and verify ownership
     const { rows: chapterRows } = await pool.query(
-      `SELECT c.id, c.book_id, b.user_id
+      `SELECT c.id, c.book_id, c.part_id, b.user_id, b.chapter_order
        FROM chapters c
        JOIN books b ON c.book_id = b.id
        WHERE c.id = $1`,
@@ -1677,38 +1672,66 @@ app.put("/chapters/:chapterId/reorder", authenticateJWT, async (req: Authenticat
       return res.status(404).json({ error: "Chapter not found" });
     }
 
-    if (chapterRows[0].user_id !== dbUser.id) {
+    const chapter = chapterRows[0];
+    if (chapter.user_id !== dbUser.id) {
       return res.status(403).json({ error: "You don't have permission to modify this chapter" });
     }
 
-    const updates = [];
-    const values = [];
-    let paramCount = 1;
+    await withTx(async (client) => {
+      // Update part assignment if specified
+      if (partId !== undefined) {
+        await client.query(
+          'UPDATE chapters SET part_id = $1 WHERE id = $2',
+          [partId === null ? null : partId, req.params.chapterId]
+        );
 
-    if (position !== undefined) {
-      updates.push(`position = $${paramCount++}`);
-      values.push(position);
-    }
+        // Update part arrays
+        if (chapter.part_id) {
+          // Remove from old part
+          await client.query(
+            `UPDATE book_parts
+             SET chapter_order = array_remove(chapter_order, $1)
+             WHERE id = $2`,
+            [req.params.chapterId, chapter.part_id]
+          );
+        }
 
-    if (partId !== undefined) {
-      updates.push(`part_id = $${paramCount++}`);
-      values.push(partId === null ? null : partId);
-    }
+        if (partId && partId !== null) {
+          // Add to new part at specified position or end
+          if (partPosition !== undefined) {
+            // Insert at specific position
+            await client.query(
+              `UPDATE book_parts
+               SET chapter_order = array_insert(chapter_order, $1, $2)
+               WHERE id = $3`,
+              [partPosition + 1, req.params.chapterId, partId] // PostgreSQL arrays are 1-indexed
+            );
+          } else {
+            // Add to end
+            await client.query(
+              `UPDATE book_parts
+               SET chapter_order = array_append(chapter_order, $1)
+               WHERE id = $2`,
+              [req.params.chapterId, partId]
+            );
+          }
+        }
+      }
 
-    if (updates.length === 0) {
-      return res.status(400).json({ error: "No updates provided" });
-    }
+      // Update book order if specified
+      if (bookPosition !== undefined) {
+        // Remove from current position and insert at new position
+        let newOrder = chapter.chapter_order.filter(id => id !== req.params.chapterId);
+        newOrder.splice(bookPosition, 0, req.params.chapterId);
 
-    values.push(req.params.chapterId);
+        await client.query(
+          'UPDATE books SET chapter_order = $1 WHERE id = $2',
+          [newOrder, chapter.book_id]
+        );
+      }
+    });
 
-    const { rows } = await pool.query(
-      `UPDATE chapters SET ${updates.join(', ')}
-       WHERE id = $${paramCount}
-       RETURNING id, position, part_id`,
-      values
-    );
-
-    res.json(rows[0]);
+    res.json({ success: true });
   } catch (error) {
     console.error("Reorder chapter error:", error);
     res.status(500).json({ error: "Failed to reorder chapter" });
@@ -1718,7 +1741,14 @@ app.put("/chapters/:chapterId/reorder", authenticateJWT, async (req: Authenticat
 // Batch reorder chapters (for drag and drop)
 app.put("/books/:bookId/chapters/reorder", authenticateJWT, async (req: AuthenticatedRequest, res) => {
   try {
-    const { chapters } = req.body; // Array of { id, position, partId? }
+    const { chapterOrder, partUpdates } = req.body;
+    // chapterOrder: Array of chapter IDs in new book order
+    // partUpdates: { [partId]: chapterIds[] } - chapters assigned to each part
+
+    console.log('Backend received chapter reorder:', {
+      bookOrder: chapterOrder?.length,
+      partUpdates: Object.keys(partUpdates || {}).length
+    });
 
     if (!req.user) {
       return res.status(401).json({ error: "User not authenticated" });
@@ -1743,15 +1773,46 @@ app.put("/books/:bookId/chapters/reorder", authenticateJWT, async (req: Authenti
       return res.status(403).json({ error: "You don't have permission to modify this book" });
     }
 
-    // Update all chapters in a transaction
+    // Update arrays in a transaction - much simpler!
     await withTx(async (client) => {
-      for (const chapter of chapters) {
+      // Update book's global chapter order
+      if (chapterOrder) {
         await client.query(
-          `UPDATE chapters
-           SET position = $1, part_id = $2
-           WHERE id = $3 AND book_id = $4`,
-          [chapter.position, chapter.partId || null, chapter.id, req.params.bookId]
+          'UPDATE books SET chapter_order = $1 WHERE id = $2',
+          [chapterOrder, req.params.bookId]
         );
+      }
+
+      // Update part assignments for chapters
+      if (partUpdates) {
+        for (const [partId, chapterIds] of Object.entries(partUpdates)) {
+          if (partId === 'null') {
+            // Remove chapters from parts (set part_id to null)
+            const chapterIdsArray = chapterIds as string[];
+            if (chapterIdsArray.length > 0) {
+              await client.query(
+                `UPDATE chapters SET part_id = NULL
+                 WHERE id = ANY($1) AND book_id = $2`,
+                [chapterIdsArray, req.params.bookId]
+              );
+            }
+          } else {
+            // Update part's chapter order and assign chapters to part
+            const chapterIdsArray = chapterIds as string[];
+            await client.query(
+              'UPDATE book_parts SET chapter_order = $1 WHERE id = $2',
+              [chapterIdsArray, partId]
+            );
+
+            if (chapterIdsArray.length > 0) {
+              await client.query(
+                `UPDATE chapters SET part_id = $1
+                 WHERE id = ANY($2) AND book_id = $3`,
+                [partId, chapterIdsArray, req.params.bookId]
+              );
+            }
+          }
+        }
       }
     });
 
